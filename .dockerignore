@@ -1,0 +1,6 @@
+node_modules
+dist
+.git
+test/fixtures/*.mp4
+test/fixtures/*.mkv
+test/fixtures/*.mp3

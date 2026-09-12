@@ -1,0 +1,34 @@
+# MetaMesh Plugin: still-extractor - Test Image
+# Builds the plugin and runs tests with ffmpeg available
+
+FROM node:20-slim
+
+# Install ffmpeg for fixture generation and integration tests
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy package files and install ALL dependencies (including devDependencies)
+COPY package.json tsconfig.json vitest.config.ts ./
+RUN npm install
+
+# Copy source and test files
+COPY src/ ./src/
+COPY test/ ./test/
+
+# Build the plugin
+RUN npm run build
+
+# Generate test fixtures
+RUN chmod +x ./test/fixtures/generate-test-fixtures.sh && \
+    ./test/fixtures/generate-test-fixtures.sh
+
+# Temp dir the extractor writes frames into before upload
+RUN mkdir -p /cache/temp && chmod 777 /cache
+
+ENV NODE_ENV=test
+ENV CACHE_PATH=/cache
+
+CMD ["npm", "test"]
