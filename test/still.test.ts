@@ -23,6 +23,14 @@ import {
     selectPrimaryVideoStream,
     extractStill,
     grabFrame,
+    configure,
+    withExtractionSlot,
+    probeDuration,
+    durationFromMeta,
+    probeMedia,
+    pickPrimaryVideoStream,
+    recentlyFailed,
+    rememberNoUsableFrame,
 } from '../src/plugin.js';
 import type { CallbackPayload } from '../src/types.js';
 
@@ -280,5 +288,177 @@ describe('process - skip logic', () => {
         );
         expect(seen[0].status).toBe('skipped');
         expect(seen[0].reason).toBe('No video stream');
+    });
+});
+
+describe('withExtractionSlot', () => {
+    const measurePeak = async (jobs: number) => {
+        let active = 0;
+        let peak = 0;
+        const job = () => withExtractionSlot(async () => {
+            active++;
+            peak = Math.max(peak, active);
+            await new Promise((r) => setTimeout(r, 20));
+            active--;
+        });
+        await Promise.all(Array.from({ length: jobs }, job));
+        return peak;
+    };
+
+    it('never runs more extractions than maxConcurrent', async () => {
+        // The dev-stack OOM: four concurrent 1080p grabs in a 512 MiB container.
+        configure({ maxConcurrent: 1 });
+        expect(await measurePeak(4)).toBe(1);
+    });
+
+    it('allows parallelism when configured, and releases every slot', async () => {
+        configure({ maxConcurrent: 3 });
+        expect(await measurePeak(6)).toBe(3);
+        configure({ maxConcurrent: 1 });
+        expect(await measurePeak(3)).toBe(1);
+    });
+
+    it('releases the slot when the job throws', async () => {
+        configure({ maxConcurrent: 1 });
+        await expect(withExtractionSlot(async () => { throw new Error('boom'); })).rejects.toThrow('boom');
+        expect(await measurePeak(2)).toBe(1); // would hang forever if the slot leaked
+    });
+});
+
+describe('configure', () => {
+    it.skipIf(!ffmpegAvailable || !fixturesReady)(
+        'treats null numeric values as absent instead of zero',
+        async () => {
+            // Number(null) === 0: before the fix this set a 0 px width and a 0 ms
+            // timeout, killing every grab on the spot.
+            configure({ maxWidth: null, jpegQuality: null, frameTimeoutMs: null, maxConcurrent: null });
+            mkdirSync(TEMP, { recursive: true });
+            const result = await extractStill(fixture('color.mp4'), 0, 10, TEMP);
+            expect(result).not.toBeNull();
+        }
+    );
+});
+
+describe.skipIf(!ffmpegAvailable || !fixturesReady)('probeDuration', () => {
+    it('reads the duration from the file header', async () => {
+        const d = await probeDuration(fixture('color.mp4'));
+        expect(d).toBeGreaterThan(9);
+        expect(d).toBeLessThan(11);
+    });
+
+    it('returns undefined for an unreadable input instead of throwing', async () => {
+        expect(await probeDuration(fixture('does-not-exist.mkv'))).toBeUndefined();
+    });
+
+    it('turns a record with no duration into real candidate offsets, not the 10s/0s fallback', async () => {
+        const d = await probeDuration(fixture('black-head.mp4'));
+        expect(d).toBeDefined();
+        expect(candidateOffsets(d)).not.toEqual([10, 0]);
+        // and the 20% candidate lands past the 6s black head
+        expect(candidateOffsets(d)[0]).toBeGreaterThanOrEqual(4);
+    });
+});
+
+describe('durationFromMeta', () => {
+    it('reads the nested document form meta-sort actually sends', () => {
+        expect(durationFromMeta({ fileType: 'video', fileinfo: { duration: '1433.089', formatName: 'matroska,webm' } }))
+            .toBeCloseTo(1433.089);
+    });
+
+    it('reads a numeric nested duration, the exact shape metasort-app/meta returns', () => {
+        // Captured from the dev stack: fileinfo.duration is a JSON number there, not a string.
+        expect(durationFromMeta({ fileinfo: { duration: 1433.089, formatName: 'matroska,webm' } })).toBe(1433.089);
+    });
+
+    it('reads the flat meta-core key', () => {
+        expect(durationFromMeta({ 'fileinfo/duration': '1380.031' })).toBeCloseTo(1380.031);
+    });
+
+    it('reads a JSON-string fileinfo', () => {
+        expect(durationFromMeta({ fileinfo: JSON.stringify({ duration: '42.5' }) })).toBe(42.5);
+    });
+
+    it('treats missing, zero and junk values as absent', () => {
+        expect(durationFromMeta(undefined)).toBeUndefined();
+        expect(durationFromMeta({})).toBeUndefined();
+        expect(durationFromMeta({ fileinfo: {} })).toBeUndefined();
+        expect(durationFromMeta({ fileinfo: { duration: '0' } })).toBeUndefined();
+        expect(durationFromMeta({ fileinfo: { duration: 'N/A' } })).toBeUndefined();
+        expect(durationFromMeta({ fileinfo: 'not json' })).toBeUndefined();
+    });
+});
+
+describe('selectPrimaryVideoStream — nested payload shapes', () => {
+    it('reads a nested stream object keyed by index', () => {
+        const picked = selectPrimaryVideoStream({
+            stream: {
+                '0': JSON.stringify({ type: 'audio', index: 0 }),
+                '1': JSON.stringify({ type: 'video', index: 1, width: 1280, height: 720, codec: 'h264', frameRate: '24/1' }),
+            },
+        } as unknown as Record<string, string>);
+        expect(picked?.index).toBe(1);
+    });
+
+    it('reads a nested stream array of objects', () => {
+        const picked = selectPrimaryVideoStream({
+            stream: [
+                { type: 'video', index: 0, width: 1920, height: 1080, codec: 'av1', frameRate: '24000/1001' },
+                { type: 'audio', index: 1 },
+            ],
+        } as unknown as Record<string, string>);
+        expect(picked?.index).toBe(0);
+    });
+});
+
+describe('pickPrimaryVideoStream', () => {
+    it('never prefers an attached picture, even one with a frame rate', () => {
+        const picked = pickPrimaryVideoStream([
+            { index: 0, width: 640, height: 480, codec: 'h264', frameRate: '24/1' },
+            { index: 1, width: 1000, height: 1500, codec: 'h264', frameRate: '24/1', attachedPic: true },
+        ]);
+        expect(picked?.index).toBe(0);
+    });
+
+    it('returns null with no candidates', () => {
+        expect(pickPrimaryVideoStream([])).toBeNull();
+    });
+});
+
+describe.skipIf(!ffmpegAvailable || !fixturesReady)('probeMedia', () => {
+    it('reads the duration and video stream of a plain video', async () => {
+        const probe = await probeMedia(fixture('color.mp4'));
+        expect(probe.duration).toBeGreaterThan(9);
+        expect(pickPrimaryVideoStream(probe.videoStreams)?.width).toBe(320);
+    });
+
+    it('flags attached cover art and never picks it', async () => {
+        const probe = await probeMedia(fixture('cover-art.mp4'));
+        expect(probe.videoStreams.some((v) => v.attachedPic)).toBe(true);
+        const primary = pickPrimaryVideoStream(probe.videoStreams);
+        expect(primary?.attachedPic).toBe(false);
+        expect(primary?.width).toBe(320);
+    });
+
+    it('finds no video stream in audio-only input', async () => {
+        expect(pickPrimaryVideoStream((await probeMedia(fixture('audio-only.mp3'))).videoStreams)).toBeNull();
+    });
+
+    it('returns an empty probe for unreadable input instead of throwing', async () => {
+        expect(await probeMedia(fixture('does-not-exist.mkv'))).toEqual({ videoStreams: [] });
+    });
+});
+
+describe('no-usable-frame memory', () => {
+    it('remembers a failed cid for an hour, then forgets it', () => {
+        const t0 = 1_000_000;
+        expect(recentlyFailed('bafk-fail', t0)).toBe(false);
+        rememberNoUsableFrame('bafk-fail', t0);
+        expect(recentlyFailed('bafk-fail', t0 + 59 * 60 * 1000)).toBe(true);
+        expect(recentlyFailed('bafk-fail', t0 + 61 * 60 * 1000)).toBe(false);
+    });
+
+    it('is keyed per cid', () => {
+        rememberNoUsableFrame('bafk-a', 5);
+        expect(recentlyFailed('bafk-b', 5)).toBe(false);
     });
 });

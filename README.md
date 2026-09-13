@@ -38,14 +38,28 @@ in `src/plugin.ts`.
 
 ## How a frame is chosen
 
-1. Candidate offsets at 20 / 45 / 70 % of `fileinfo/duration`, clamped 2s away
-   from both ends (the head is logos and black, the tail is credits).
-2. At each offset, one ffmpeg run with **input seeking** (`-ss` before `-i`, so
-   it Range-seeks over WebDAV instead of decoding from zero) and
-   `thumbnail=60`, which picks the most representative of the next 60 frames.
-3. The encoded JPEG is measured (mean + stddev of a 32×32 grayscale reduction).
+1. **Record first, file second.** `fileinfo/duration` and the stream table
+   from the record; if either is missing, one header-only `ffprobe` reads it
+   from the file (a record with no stream data at all has been seen on the dev
+   stack). meta-sort treats a `failed` or
+   `skipped` ffmpeg dependency as complete, so a missing duration is a normal
+   case, not a bug. Only if the probe fails too does it fall back to a blind
+   10s then 0s — and that fallback lands on distributor idents and opening
+   credits, so it is a last resort.
+2. Candidate offsets at 20 / 45 / 70 % of the duration, clamped 2s away from
+   both ends (the head is logos and black, the tail is credits).
+3. At each offset, one ffmpeg run with **input seeking** (`-ss` before `-i`, so
+   it Range-seeks over WebDAV instead of decoding from zero), scaled down
+   **before** `thumbnail=60` picks the most representative of the next 60
+   frames. That order matters: `thumbnail` buffers all 60 frames, and at full
+   1080p a single grab peaked at 409 MiB versus 196 MiB scaled-first.
+4. The encoded JPEG is measured (mean + stddev of a 32×32 grayscale reduction).
    Black, blown-out and flat frames are rejected and the next offset is tried.
-4. All candidates rejected → `skipped`, no field written.
+5. All candidates rejected → `skipped`, no field written.
+
+Extractions run **one at a time** by default (`maxConcurrent`). meta-sort's
+background queue sends several tasks at once, and four concurrent 1080p grabs
+OOM-killed the 512 MiB container; with one CPU, parallel decodes buy nothing.
 
 The primary video stream is the largest one that **looks like moving video** —
 not `0:v:0`, and not simply the largest. ffprobe reports attached cover art as
@@ -68,6 +82,7 @@ curl -k -X PUT https://metasort-dev.localhost:8180/api/plugins/still-extractor/c
 | `maxWidth` | `640` | Frame is scaled down to at most this width |
 | `jpegQuality` | `4` | ffmpeg `-q:v`; lower is better quality |
 | `frameTimeoutMs` | `120000` | Hard kill for one ffmpeg grab |
+| `maxConcurrent` | `1` | Extractions allowed to run at once in this instance |
 
 ## Development
 
@@ -80,3 +95,18 @@ docker build -t metamesh-plugin-still-extractor:main .
 
 Depends on `file-info` (for `fileType`) and `ffmpeg` (for `fileinfo/duration`
 and the `stream/{n}` table). Runs on the **background** queue.
+
+### What meta-sort actually sends
+
+⚠ The `existingMeta` in a `/process` request is the **nested document form** —
+`fileinfo: { duration }`, `stream: [...]`, `cids: [...]` — not the flat
+`fileinfo/duration` / `stream/{n}` keys you see in meta-core's flat record.
+Reading only the flat key made every task fall back to 10s/0s on the dev stack.
+`durationFromMeta` and `selectPrimaryVideoStream` accept both shapes; keep it
+that way.
+
+A replay or rescan queues several tasks for the same file. Each reads the
+record at dispatch, so the plugin re-checks `still` in meta-core once it holds
+an extraction slot, instead of recomputing the same frame for every duplicate.
+A file that yields no usable frame is remembered in memory for an hour, so its
+queued duplicates skip instead of decoding it again; a later rescan retries.

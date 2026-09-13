@@ -77,6 +77,7 @@ export const manifest: PluginManifest = {
         maxWidth: { type: 'number', label: 'Max Width (px)', default: 640 },
         jpegQuality: { type: 'number', label: 'JPEG Quality (ffmpeg -q:v, lower is better)', default: 4 },
         frameTimeoutMs: { type: 'number', label: 'Per-Frame ffmpeg Timeout (ms)', default: 120000 },
+        maxConcurrent: { type: 'number', label: 'Max Concurrent Extractions', default: 1 },
     },
 };
 
@@ -86,6 +87,20 @@ let seekPercents = [20, 45, 70];
 let maxWidth = 640;
 let jpegQuality = 4;
 let frameTimeoutMs = 120000;
+let maxConcurrent = 1;
+
+/**
+ * A config value as a number, or undefined when it is absent.
+ *
+ * ⚠ Not `Number.isFinite(Number(v))`: `Number(null)` and `Number('')` are both
+ * `0`, so a config payload carrying `"maxWidth": null` would silently set a
+ * 0-pixel width or a 0 ms timeout.
+ */
+function configNumber(v: unknown): number | undefined {
+    if (v === null || v === undefined || v === '') return undefined;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : undefined;
+}
 
 export function configure(config: Record<string, unknown>): void {
     forceRecompute = config.forceRecompute === true;
@@ -96,13 +111,70 @@ export function configure(config: Record<string, unknown>): void {
             .filter((p) => Number.isFinite(p) && p > 0 && p < 100);
         if (parsed.length > 0) seekPercents = parsed;
     }
-    if (Number.isFinite(Number(config.maxWidth))) maxWidth = Number(config.maxWidth);
-    if (Number.isFinite(Number(config.jpegQuality))) jpegQuality = Number(config.jpegQuality);
-    if (Number.isFinite(Number(config.frameTimeoutMs))) frameTimeoutMs = Number(config.frameTimeoutMs);
+    const width = configNumber(config.maxWidth);
+    if (width !== undefined && width > 0) maxWidth = width;
+    const quality = configNumber(config.jpegQuality);
+    if (quality !== undefined && quality >= 1 && quality <= 31) jpegQuality = quality;
+    const timeout = configNumber(config.frameTimeoutMs);
+    if (timeout !== undefined && timeout > 0) frameTimeoutMs = timeout;
+    const concurrent = configNumber(config.maxConcurrent);
+    if (concurrent !== undefined && concurrent >= 1) maxConcurrent = Math.floor(concurrent);
     console.log(
         `[still-extractor] Config: forceRecompute=${forceRecompute}, seekPercents=${seekPercents.join(',')}, ` +
-        `maxWidth=${maxWidth}, jpegQuality=${jpegQuality}, frameTimeoutMs=${frameTimeoutMs}`
+        `maxWidth=${maxWidth}, jpegQuality=${jpegQuality}, frameTimeoutMs=${frameTimeoutMs}, maxConcurrent=${maxConcurrent}`
     );
+}
+
+let activeExtractions = 0;
+const extractionWaiters: Array<() => void> = [];
+
+/**
+ * Run `fn` once an extraction slot is free.
+ *
+ * meta-sort's background queue dispatches several tasks at this single
+ * instance at once, and each ffmpeg grab of a 1080p file peaks near 200 MiB
+ * even with the scale-first chain. Four at a time OOM-killed the 512 MiB
+ * container on the dev stack (`OOMKilled=true`, ffmpeg dying on SIGKILL). The
+ * container gets one CPU, so running them concurrently buys no throughput
+ * anyway — the cap lives here so it holds whatever the scheduler sends.
+ */
+export async function withExtractionSlot<T>(fn: () => Promise<T>): Promise<T> {
+    while (activeExtractions >= maxConcurrent) {
+        await new Promise<void>((resolve) => extractionWaiters.push(resolve));
+    }
+    activeExtractions++;
+    try {
+        return await fn();
+    } finally {
+        activeExtractions--;
+        extractionWaiters.shift()?.();
+    }
+}
+
+/**
+ * Files that produced no usable frame, remembered briefly by cid.
+ *
+ * A failed extraction writes no `still`, so the slot-time re-check cannot stop
+ * the duplicates a replay or rescan queues behind it — on the dev stack a 17s
+ * title-card test clip was fully decoded a dozen times in a row. An in-memory
+ * TTL absorbs that burst without inventing a persisted "tried and failed" key,
+ * and a rescan after the TTL still gets a fresh attempt.
+ */
+const NO_USABLE_FRAME_TTL_MS = 60 * 60 * 1000;
+const noUsableFrameAt = new Map<string, number>();
+
+export function recentlyFailed(cid: string, now = Date.now()): boolean {
+    const at = noUsableFrameAt.get(cid);
+    if (at === undefined) return false;
+    if (now - at > NO_USABLE_FRAME_TTL_MS) {
+        noUsableFrameAt.delete(cid);
+        return false;
+    }
+    return true;
+}
+
+export function rememberNoUsableFrame(cid: string, now = Date.now()): void {
+    noUsableFrameAt.set(cid, now);
 }
 
 /**
@@ -185,6 +257,32 @@ export interface VideoStream {
     height?: number;
     codec?: string;
     frameRate?: string;
+    /** ffprobe's `attached_pic` disposition. Probe path only — the ffmpeg
+     *  plugin's stream table does not carry dispositions. */
+    attachedPic?: boolean;
+}
+
+/**
+ * `fileinfo/duration` out of whichever shape the payload carries.
+ *
+ * ⚠ meta-sort's /process payload is the NESTED document form — `fileinfo:
+ * { duration }`, `stream: [...]`, `cids: [...]` — not meta-core's flat
+ * `fileinfo/duration` keys. On the dev stack every task's existingMeta had
+ * `fileinfo` and `stream`, never `fileinfo/duration`, and reading only the flat
+ * key sent 16 of 16 stills to the 10s/0s fallback. Accept both, plus a
+ * JSON-string `fileinfo`.
+ */
+export function durationFromMeta(existingMeta: Record<string, unknown> | undefined): number | undefined {
+    if (!existingMeta) return undefined;
+    let fileinfo: unknown = existingMeta['fileinfo'];
+    if (typeof fileinfo === 'string') {
+        try { fileinfo = JSON.parse(fileinfo); } catch { fileinfo = undefined; }
+    }
+    const raw = existingMeta['fileinfo/duration']
+        ?? (fileinfo && typeof fileinfo === 'object' ? (fileinfo as Record<string, unknown>)['duration'] : undefined);
+    if (raw === null || raw === undefined || raw === '') return undefined;
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
 /**
@@ -210,19 +308,21 @@ const STILL_IMAGE_CODECS = new Set(['mjpeg', 'png', 'bmp', 'gif', 'webp', 'tiff'
  * within the better class; if nothing looks like moving video we fall back to
  * the largest of whatever is there rather than giving up.
  *
- * Accepts both shapes meta-core hands back: the namespaced `stream/{n}` keys
- * the ffmpeg plugin writes, and the flattened `stream` array.
+ * Accepts both shapes: the nested `stream` collection meta-sort's /process
+ * payload actually carries (array, JSON string, or index-keyed object), and the
+ * namespaced `stream/{n}` keys meta-core stores.
  */
 export function selectPrimaryVideoStream(existingMeta: Record<string, string> | undefined): VideoStream | null {
     if (!existingMeta) return null;
 
     const raw: unknown[] = [];
 
-    const flattened = existingMeta['stream'] as unknown;
-    if (flattened) {
+    const nested = existingMeta['stream'] as unknown;
+    if (nested) {
         try {
-            const arr = Array.isArray(flattened) ? flattened : JSON.parse(String(flattened));
-            if (Array.isArray(arr)) raw.push(...arr);
+            const parsed = typeof nested === 'string' ? JSON.parse(nested) : nested;
+            if (Array.isArray(parsed)) raw.push(...parsed);
+            else if (parsed && typeof parsed === 'object') raw.push(...Object.values(parsed as Record<string, unknown>));
         } catch {
             // fall through to the namespaced form
         }
@@ -234,9 +334,7 @@ export function selectPrimaryVideoStream(existingMeta: Record<string, string> | 
         }
     }
 
-    const moving: VideoStream[] = [];
-    const other: VideoStream[] = [];
-
+    const candidates: VideoStream[] = [];
     for (const entry of raw) {
         let stream: {
             type?: string; index?: number; width?: number; height?: number;
@@ -249,22 +347,31 @@ export function selectPrimaryVideoStream(existingMeta: Record<string, string> | 
         }
         if (!stream || stream.type !== 'video' || stream.index == null) continue;
 
-        const candidate: VideoStream = {
+        candidates.push({
             index: Number(stream.index),
             width: stream.width != null ? Number(stream.width) : undefined,
             height: stream.height != null ? Number(stream.height) : undefined,
             codec: stream.codec,
             frameRate: stream.frameRate,
-        };
-
-        const looksMoving =
-            !!candidate.frameRate && !STILL_IMAGE_CODECS.has((candidate.codec ?? '').toLowerCase());
-        (looksMoving ? moving : other).push(candidate);
+        });
     }
+    return pickPrimaryVideoStream(candidates);
+}
 
-    const area = (s: VideoStream) => (s.width ?? 0) * (s.height ?? 0);
-    const pool = moving.length > 0 ? moving : other;
-    return pool.reduce<VideoStream | null>((best, s) => (!best || area(s) > area(best) ? s : best), null);
+/**
+ * The moving picture among video candidates, wherever they came from.
+ *
+ * Prefers streams that have a frame rate, are not a still-image codec and are
+ * not flagged as an attached picture; the largest area wins within that class,
+ * falling back to the largest of the rest rather than giving up.
+ */
+export function pickPrimaryVideoStream(candidates: VideoStream[]): VideoStream | null {
+    const looksMoving = (v: VideoStream) =>
+        !v.attachedPic && !!v.frameRate && !STILL_IMAGE_CODECS.has((v.codec ?? '').toLowerCase());
+    const moving = candidates.filter(looksMoving);
+    const pool = moving.length > 0 ? moving : candidates;
+    const area = (v: VideoStream) => (v.width ?? 0) * (v.height ?? 0);
+    return pool.reduce<VideoStream | null>((best, v) => (!best || area(v) > area(best) ? v : best), null);
 }
 
 /**
@@ -323,7 +430,7 @@ function run(
     cmd: string,
     args: string[],
     timeoutMs: number
-): Promise<{ code: number | null; stdout: Buffer; stderr: string; timedOut: boolean }> {
+): Promise<{ code: number | null; signal: NodeJS.Signals | null; stdout: Buffer; stderr: string; timedOut: boolean }> {
     return new Promise((resolve) => {
         const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
         const stdout: Buffer[] = [];
@@ -342,13 +449,72 @@ function run(
         });
         child.on('error', (err) => {
             clearTimeout(timer);
-            resolve({ code: null, stdout: Buffer.concat(stdout), stderr: stderr + String(err), timedOut });
+            resolve({ code: null, signal: null, stdout: Buffer.concat(stdout), stderr: stderr + String(err), timedOut });
         });
-        child.on('close', (code) => {
+        child.on('close', (code, signal) => {
             clearTimeout(timer);
-            resolve({ code, stdout: Buffer.concat(stdout), stderr, timedOut });
+            resolve({ code, signal, stdout: Buffer.concat(stdout), stderr, timedOut });
         });
     });
+}
+
+export interface MediaProbe {
+    duration?: number;
+    videoStreams: VideoStream[];
+}
+
+/**
+ * Duration and video streams read straight from the file.
+ *
+ * Both normally arrive from the ffmpeg plugin, but meta-sort marks a dependency
+ * complete on `failed` and `skipped` callbacks as well as `completed`
+ * (ContainerPluginScheduler.markPluginCompleted), so a still task can run
+ * against a record missing either — or both: on the dev stack a midhash record
+ * had `fileType=video` and no `fileinfo` or `stream` at all. Without a duration
+ * frame choice falls back to 10s/0s (idents and opening credits); without
+ * streams there is nothing to map. One header-only ffprobe answers both.
+ */
+export async function probeMedia(input: string): Promise<MediaProbe> {
+    const args = ['-v', 'error'];
+    if (/^https?:\/\//i.test(input)) {
+        args.push('-rw_timeout', '30000000'); // microseconds
+    }
+    args.push('-print_format', 'json', '-show_format', '-show_streams', input);
+
+    const result = await run('ffprobe', args, 30000);
+    if (result.timedOut || result.code !== 0) return { videoStreams: [] };
+
+    let parsed: {
+        format?: { duration?: string };
+        streams?: Array<{
+            codec_type?: string; index?: number; codec_name?: string;
+            width?: number; height?: number; avg_frame_rate?: string;
+            disposition?: { attached_pic?: number };
+        }>;
+    };
+    try {
+        parsed = JSON.parse(result.stdout.toString());
+    } catch {
+        return { videoStreams: [] };
+    }
+
+    const duration = Number(parsed.format?.duration);
+    const videoStreams = (parsed.streams ?? [])
+        .filter((v) => v.codec_type === 'video' && v.index != null)
+        .map((v): VideoStream => ({
+            index: Number(v.index),
+            width: v.width,
+            height: v.height,
+            codec: v.codec_name,
+            frameRate: v.avg_frame_rate && v.avg_frame_rate !== '0/0' ? v.avg_frame_rate : undefined,
+            attachedPic: v.disposition?.attached_pic === 1,
+        }));
+    return { duration: Number.isFinite(duration) && duration > 0 ? duration : undefined, videoStreams };
+}
+
+/** Container duration read from the file — see probeMedia. */
+export async function probeDuration(input: string): Promise<number | undefined> {
+    return (await probeMedia(input)).duration;
 }
 
 /**
@@ -365,7 +531,9 @@ export async function grabFrame(
     offsetSec: number,
     outputPath: string
 ): Promise<Buffer | null> {
-    const args = ['-y', '-hide_banner', '-loglevel', 'error'];
+    // -threads caps the decoder's thread pool. Left alone, dav1d/hevc size it
+    // to the host's cores, and every thread holds its own frame buffers.
+    const args = ['-y', '-hide_banner', '-loglevel', 'error', '-threads', '2'];
 
     // rw_timeout is a protocol option; only http/tcp accept it, and passing it
     // to the file protocol makes ffmpeg bail before it starts.
@@ -380,8 +548,11 @@ export async function grabFrame(
         '-an', '-sn', '-dn',
         '-frames:v', '1',
         // thumbnail=N picks the most representative of the next N frames rather
-        // than whatever the seek happened to land on.
-        '-vf', `thumbnail=60,scale='min(iw,${maxWidth})':-2`,
+        // than whatever the seek happened to land on — and it BUFFERS all N.
+        // ⚠ Scale first. `thumbnail=60,scale=…` holds 60 full-resolution frames;
+        // on a 1080p AV1 episode that peaked at 409 MiB, and `scale=…,thumbnail=60`
+        // at 196 MiB (and 2s instead of 4s) for a byte-for-byte comparable JPEG.
+        '-vf', `scale='min(iw,${maxWidth})':-2,thumbnail=60`,
         '-q:v', String(jpegQuality),
         '-f', 'image2',
         outputPath
@@ -393,7 +564,12 @@ export async function grabFrame(
         return null;
     }
     if (result.code !== 0 || !existsSync(outputPath)) {
-        console.warn(`[still-extractor] ffmpeg failed at ${offsetSec}s: ${result.stderr.trim() || `exit ${result.code}`}`);
+        // A signal with no stderr is the kernel, not ffmpeg: in practice the
+        // OOM killer. Say so, instead of the old unhelpful "exit null".
+        const why = result.signal
+            ? `killed by ${result.signal}${result.signal === 'SIGKILL' ? ' (likely out of memory)' : ''}`
+            : result.stderr.trim() || `exit ${result.code}`;
+        console.warn(`[still-extractor] ffmpeg failed at ${offsetSec}s: ${why}`);
         return null;
     }
 
@@ -497,12 +673,16 @@ export async function process(
     const { taskId, cid, filePath, existingMeta } = request;
     const metaCore = new MetaCoreClient(request.metaCoreUrl);
 
-    const skip = (reason: string) =>
-        sendCallback({ taskId, status: 'skipped', duration: Date.now() - startTime, reason });
+    const skip = (reason: string, quiet = false) => {
+        // Every non-video file in the library comes through here too — logging
+        // those would bury the skips that matter ("No video stream" on a video).
+        if (!quiet) console.log(`[still-extractor] ${filePath}: skipped — ${reason}`);
+        return sendCallback({ taskId, status: 'skipped', duration: Date.now() - startTime, reason });
+    };
 
     try {
         if (existingMeta?.fileType !== 'video') {
-            await skip('Not a video file');
+            await skip('Not a video file', true);
             return;
         }
 
@@ -514,16 +694,17 @@ export async function process(
             return;
         }
 
-        const stream = selectPrimaryVideoStream(existingMeta);
-        if (!stream) {
-            await skip('No video stream');
-            return;
-        }
+        let stream = selectPrimaryVideoStream(existingMeta);
 
         // WebDAV of the very core we're enriching, so the frame bytes and the
         // CID we write can never point at different cores.
         const webdavClient = await getWebDAVClient(request.metaCoreUrl);
         if (!webdavClient) {
+            if (!stream) {
+                // Nothing in the record and no way to read the file.
+                await skip('No video stream');
+                return;
+            }
             await sendCallback({
                 taskId,
                 status: 'failed',
@@ -533,10 +714,61 @@ export async function process(
             return;
         }
 
-        const duration = Number(existingMeta?.['fileinfo/duration']);
         const input = webdavClient.toWebDAVUrl(filePath);
+        let probe: MediaProbe | undefined;
+        const probeOnce = async () => (probe ??= await probeMedia(input));
 
-        const extracted = await extractStill(input, stream.index, Number.isFinite(duration) ? duration : undefined);
+        let streamSource = '';
+        if (!stream) {
+            stream = pickPrimaryVideoStream((await probeOnce()).videoStreams);
+            streamSource = ' [probed]';
+            if (!stream) {
+                await skip('No video stream');
+                return;
+            }
+        }
+
+        const recordDuration = durationFromMeta(existingMeta as Record<string, unknown> | undefined);
+
+        if (recordDuration === undefined) {
+            // Name what this task actually received, so an upstream cause of a
+            // missing duration stays diagnosable even though we recover from it.
+            const keys = Object.keys(existingMeta ?? {});
+            console.warn(
+                `[still-extractor] ${filePath}: no usable fileinfo/duration ` +
+                `(fileinfo=${JSON.stringify((existingMeta as Record<string, unknown> | undefined)?.['fileinfo'] ?? existingMeta?.['fileinfo/duration'] ?? null).slice(0, 120)}), probing the file; ` +
+                `existingMeta has ${keys.length} keys: ${keys.slice(0, 40).join(', ')}`
+            );
+        }
+        const duration = recordDuration ?? (await probeOnce()).duration;
+        const durationSource = recordDuration !== undefined ? 'record' : duration !== undefined ? 'probed' : 'unknown';
+
+        console.log(
+            `[still-extractor] ${filePath}: stream=0:${stream.index}${streamSource} ` +
+            `${stream.width ?? '?'}x${stream.height ?? '?'} ${stream.codec ?? ''} ` +
+            `duration=${duration ?? 'unknown'} (${durationSource}) ` +
+            `offsets=${candidateOffsets(duration).join(',')}`
+        );
+
+        const extracted = await withExtractionSlot(async () => {
+            // existingMeta was read at dispatch, before this task queued for a slot.
+            // A replay or rescan queues several tasks per file, so re-check here —
+            // otherwise every duplicate behind the first recomputes the same still.
+            if (!forceRecompute && await metaCore.getProperty(cid, 'still')) return 'present' as const;
+            if (!forceRecompute && recentlyFailed(cid)) return 'recently-failed' as const;
+            const result = await extractStill(input, stream.index, duration);
+            if (!result) rememberNoUsableFrame(cid);
+            return result;
+        });
+        if (extracted === 'present') {
+            await skip('Still already present');
+            return;
+        }
+        if (extracted === 'recently-failed') {
+            // The first attempt already logged "No usable frame".
+            await skip('No usable frame (recent attempt, not retried)', true);
+            return;
+        }
         if (!extracted) {
             await skip('No usable frame');
             return;
