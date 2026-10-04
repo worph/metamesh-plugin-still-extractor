@@ -19,6 +19,7 @@
 import Fastify from 'fastify';
 import type { HealthResponse, ProcessRequest, ProcessResponse, CallbackPayload, ConfigureRequest, ConfigureResponse } from './types.js';
 import { manifest, process as processFile, configure } from './plugin.js';
+import { startBeacon, stopBeacon } from './beacon-advertise.js';
 
 const app = Fastify({ logger: true });
 let ready = false;
@@ -70,11 +71,13 @@ app.post<{ Body: ProcessRequest }>('/process', async (request, reply) => {
 const port = parseInt(process.env.PORT || '8080', 10);
 
 app.listen({ port, host: '0.0.0.0' }).then(() => {
+    startBeacon(manifest.id, manifest.version, port);
     ready = true;
     console.log(`[${manifest.id}] Listening on port ${port}`);
 });
 
 process.on('SIGTERM', async () => {
+    await stopBeacon();
     ready = false;
     await app.close();
     process.exit(0);
